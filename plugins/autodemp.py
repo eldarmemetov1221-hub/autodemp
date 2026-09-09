@@ -452,23 +452,28 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
             _set_stat(lot_id, error="нет подкатегории", updated=time.time())
             return
 
-        # Режим цены и коэффициент комиссии FunPay (buyer = seller * k).
+        # Комиссия FunPay нужна ВСЕГДА: цена лота (get_lot_fields) — для продавца,
+        # а цены конкурентов (get_subcategory_public_lots) — уже для покупателя
+        # (с комиссией). Поэтому сравниваем всё в цене покупателя.
         with _CFG_LOCK:
             mode = _CFG.get("price_mode", "seller")
-        k = 1.0
-        if mode == "buyer":
-            k = _commission_coefficient(account, lf, subcat, stop)
-            if not k:
-                logger.error(
-                    f"{LOGGER_PREFIX} Лот {lot_id}: не удалось получить комиссию "
-                    f"FunPay — цикл пропущен (режим «для покупателя»)."
-                )
-                _set_stat(lot_id, error="нет данных о комиссии", updated=time.time())
-                return
+        k = _commission_coefficient(account, lf, subcat, stop)
+        if not k:
+            logger.error(
+                f"{LOGGER_PREFIX} Лот {lot_id}: не удалось получить комиссию FunPay "
+                f"— цикл пропущен."
+            )
+            _set_stat(lot_id, error="нет данных о комиссии", updated=time.time())
+            return
 
-        # Всё, что видит/вводит пользователь — в его единицах (buyer или seller);
-        # в FunPay сохраняется цена продавца. current_price — для отображения.
-        current_price = current_seller * k
+        current_buyer = current_seller * k
+
+        # Границы и шаг пользователя приводим к цене ПОКУПАТЕЛЯ.
+        if mode == "buyer":
+            min_b, max_b, step_b, custom_b = min_price, max_price, step, custom_price
+        else:  # заданы цены продавца — переводим в покупательские
+            min_b, max_b, step_b, custom_b = (min_price * k, max_price * k,
+                                              step * k, custom_price * k)
 
         # 2. Конкуренты в подкатегории (с кэшем и дедупликацией запросов).
         competitors = _get_competitors(account, subcat, stop)
@@ -506,32 +511,39 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
 
             filtered.append(c)
 
-        # 4. Подходят по диапазону [min_price, max_price] (в единицах пользователя:
-        #    цена конкурента-продавца переводится в те же единицы через * k).
+        # 4. Подходят по диапазону — в цене ПОКУПАТЕЛЯ (c.price уже покупательская).
         valid = [c for c in filtered
-                 if c.price is not None and min_price <= c.price * k <= max_price]
+                 if c.price is not None and min_b <= c.price <= max_b]
 
         total_found = len(filtered)
         valid_count = len(valid)
-        min_comp_seller = min((c.price for c in valid), default=None)
-        min_comp = min_comp_seller * k if min_comp_seller is not None else None
+        min_comp_buyer = min((c.price for c in valid), default=None)
 
-        # 5. Целевая цена (в единицах пользователя; без раннего округления —
-        #    финальное округление делаем уже в цене продавца).
-        target = None
+        # 5. Целевая цена покупателя (без раннего округления — округляем в
+        #    цене продавца при сохранении).
+        target_b = None
         if valid:
-            target = min_comp - step
+            target_b = min_comp_buyer - step_b
         elif strategy == "max":
-            target = max_price if max_price > 0 else None
+            target_b = max_b if max_b > 0 else None
         elif strategy == "custom":
-            target = custom_price if custom_price > 0 else None
-        # keep (по умолчанию) — target остаётся None (не менять цену).
-        # Держим цель в пределах [min_price, max_price].
-        if target is not None:
-            if min_price > 0:
-                target = max(target, min_price)     # защита: не ниже MIN PRICE
-            if max_price > 0:
-                target = min(target, max_price)
+            target_b = custom_b if custom_b > 0 else None
+        # keep (по умолчанию) — target_b остаётся None (не менять цену).
+        if target_b is not None:
+            if min_b > 0:
+                target_b = max(target_b, min_b)     # защита: не ниже MIN PRICE
+            if max_b > 0:
+                target_b = min(target_b, max_b)
+
+        # Значения для отображения — в единицах пользователя (buyer или seller).
+        def _disp(buyer_val):
+            if buyer_val is None:
+                return None
+            return buyer_val if mode == "buyer" else buyer_val / k
+
+        current_price = _disp(current_buyer)
+        min_comp = _disp(min_comp_buyer)
+        target = _disp(target_b)
 
         _set_stat(
             lot_id,
@@ -551,19 +563,19 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
             f"Текущая цена: {_fmt(current_price, symbol)}"
         )
 
-        # 6. Меняем цену, если нужно. В FunPay сохраняется цена продавца,
-        #    поэтому целевую цену переводим обратно в seller-единицы (/ k).
-        target_seller = round(target / k, 2) if target is not None else None
+        # 6. Меняем цену, если нужно. В FunPay сохраняется цена ПРОДАВЦА,
+        #    поэтому целевую цену покупателя переводим в цену продавца (/ k).
+        target_seller = round(target_b / k, 2) if target_b is not None else None
         cur_seller_r = round(current_seller, 2)
 
-        # Гарантируем реальный подрез в цене продавца (FunPay ранжирует по ней,
-        # шаг 0.01): из-за округления цель не должна оказаться >= конкурента.
-        if target_seller is not None and valid and min_comp_seller is not None:
-            mcs = round(min_comp_seller, 2)
-            if target_seller >= mcs:
-                target_seller = round(mcs - 0.01, 2)
-            if min_price > 0:                       # но не ниже нижнего предела
-                floor_seller = round(min_price / k, 2)
+        # Гарантируем реальный подрез: FunPay сортирует по цене ПОКУПАТЕЛЯ,
+        # поэтому моя цена покупателя должна быть строго ниже минимальной у
+        # конкурента (с учётом округления цены продавца до 0.01).
+        if target_seller is not None and valid and min_comp_buyer is not None:
+            if target_seller * k >= min_comp_buyer:
+                target_seller = round(target_seller - 0.01, 2)
+            if min_b > 0:                           # но не ниже нижнего предела
+                floor_seller = round(min_b / k, 2)
                 if target_seller < floor_seller:
                     target_seller = floor_seller
 
@@ -594,7 +606,7 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
                 pass
             _call_with_retry(account.save_lot, lf, stop=stop)
             _rate_register()
-            _set_stat(lot_id, current_price=target_seller * k, updated=time.time())
+            _set_stat(lot_id, current_price=_disp(target_seller * k), updated=time.time())
             logger.info(
                 f"{LOGGER_PREFIX} {header}\nНовая цена: {new_note}\n"
                 f"Цена изменена успешно"
