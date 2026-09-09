@@ -624,7 +624,9 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
         with _CFG_LOCK:
             sync_on = bool(_CFG.get("sync_refresh", False))
             sync_delay = float(_CFG.get("sync_delay", 7.0))
-        apply_ok = (_refresh_track_and_gate(getattr(subcat, "id", None), filtered, sync_delay)
+        # Ключ трекера — сам лот (а не подкатегория): у лотов одной подкатегории
+        # разные наборы конкурентов, и общий ключ приводил бы к взаимному сбросу.
+        apply_ok = (_refresh_track_and_gate(lot_id, filtered, sync_delay)
                     if sync_on else True)
 
         # 4. Подходят по диапазону — в цене ПОКУПАТЕЛЯ (c.price уже покупательская).
@@ -1217,6 +1219,8 @@ def _register_telegram(cardinal: "Cardinal") -> None:
             _STATS.pop(lot_id, None)
         with _META_LOCK:
             _LOT_META.pop(lot_id, None)
+        with _REFRESH_LOCK:
+            _REFRESH.pop(lot_id, None)
         save_config()
         _edit(call, text_main(), kb_main())
         bot.answer_callback_query(call.id, "Лот удалён")
