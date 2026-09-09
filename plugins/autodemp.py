@@ -879,6 +879,8 @@ CB_MODE = "ADmode"      # ADmode — переключить режим цены 
 CB_FAST = "ADfast"      # ADfast — вкл/выкл экспериментальную «быструю проверку»
 CB_SYNC = "ADsync"      # ADsync — вкл/выкл синхронизацию с обновлением таблицы
 CB_SYNCDELAY = "ADsdl"  # ADsdl — задать задержку после обновления таблицы
+CB_QUICK = "ADquick"    # ADquick — экран быстрого вкл/выкл лотов
+CB_QTOGGLE = "ADqt"     # ADqt:<lot_id> — быстрый тумблер лота
 CB_DELIV = "ADdlv"      # ADdlv:<lot_id> — цикл фильтра доставки
 CB_ONLINE = "ADonl"     # ADonl:<lot_id> — вкл/выкл «только онлайн»
 CB_AGGR = "ADaggr"      # ADaggr:<lot_id> — вкл/выкл агрессивный режим
@@ -926,6 +928,8 @@ def _register_telegram(cardinal: "Cardinal") -> None:
             mode = _CFG.get("price_mode", "seller")
             fast = _CFG.get("fast_check", False)
             sync = _CFG.get("sync_refresh", False)
+        if lots:
+            kb.add(B("⚡ Вкл/выкл лоты", callback_data=CB_QUICK))
         kb.add(B("➕ Добавить лот", callback_data=CB_ADD))
         kb.add(B(f"💱 Цены: {PRICE_MODE_TITLES.get(mode)}", callback_data=CB_MODE))
         kb.add(B(f"⚡ Быстрая проверка (эксп.): {'ВКЛ' if fast else 'выкл'}",
@@ -1074,6 +1078,34 @@ def _register_telegram(cardinal: "Cardinal") -> None:
         return ("🚫 <b>Игнорируемые продавцы</b>\n\n"
                 "Их лоты не учитываются при расчёте минимальной цены.\n\n" + body)
 
+    def kb_quick() -> "K":
+        kb = K()
+        with _CFG_LOCK:
+            lots = dict(_CFG["lots"])
+        for lot_id, lot in lots.items():
+            mark = "🟢" if lot.get("enabled") else "🔴"
+            name = lot.get("keyword") or lot_id          # имя из «Фильтр текста»
+            st = _get_stat(lot_id)
+            price = st.get("current_price")
+            sym = st.get("symbol", "₽")
+            label = f"{mark} {name}"
+            if price is not None:
+                label += f" · {_fmt(price, sym)}"
+            kb.add(B(label, callback_data=f"{CB_QTOGGLE}:{lot_id}"))
+        kb.add(B("◀️ Назад", callback_data=f"{CBT.PLUGIN_SETTINGS}:{UUID}:0"))
+        return kb
+
+    def text_quick() -> str:
+        with _CFG_LOCK:
+            lots = _CFG["lots"]
+            on = sum(1 for x in lots.values() if x.get("enabled"))
+            total = len(lots)
+        return ("⚡ <b>Быстрое вкл/выкл лотов</b>\n\n"
+                f"Работает: <b>{on}</b> из <b>{total}</b>\n\n"
+                "Нажмите на лот — включить/выключить автодемп.\n"
+                "🟢 — работает, 🔴 — выключен.\n"
+                "Название берётся из «Фильтр текста» (иначе Lot ID).")
+
     def _edit(call, text: str, kb) -> None:
         try:
             bot.edit_message_text(text, call.message.chat.id, call.message.id,
@@ -1094,6 +1126,36 @@ def _register_telegram(cardinal: "Cardinal") -> None:
     def open_ignore(call: "CallbackQuery"):
         _edit(call, text_ignore(), kb_ignore())
         bot.answer_callback_query(call.id)
+
+    def open_quick(call: "CallbackQuery"):
+        _edit(call, text_quick(), kb_quick())
+        bot.answer_callback_query(call.id)
+
+    def quick_toggle(call: "CallbackQuery"):
+        lot_id = call.data.split(":", 1)[1]
+        with _CFG_LOCK:
+            lot = _CFG["lots"].get(lot_id)
+            if not lot:
+                bot.answer_callback_query(call.id, "Лот не найден")
+                return
+            if not lot["enabled"]:
+                if (lot["min_price"] <= 0 or lot["max_price"] <= 0
+                        or lot["max_price"] < lot["min_price"]):
+                    bot.answer_callback_query(
+                        call.id, "Сначала задайте корректные Мин/Макс у лота!",
+                        show_alert=True)
+                    return
+            lot["enabled"] = not lot["enabled"]
+            enabled = lot["enabled"]
+            name = lot.get("keyword") or lot_id
+        save_config()
+        if enabled:
+            start_lot(cardinal, lot_id)
+        else:
+            stop_lot(lot_id, join=False)
+        _edit(call, text_quick(), kb_quick())
+        bot.answer_callback_query(
+            call.id, f"{name}: {'▶️ включён' if enabled else '⏹ выключен'}")
 
     def toggle_mode(call: "CallbackQuery"):
         with _CFG_LOCK:
@@ -1408,6 +1470,8 @@ def _register_telegram(cardinal: "Cardinal") -> None:
     tg.cbq_handler(confirm_delete, lambda c: c.data.startswith(f"{CB_DEL}:"))
     tg.cbq_handler(do_delete, lambda c: c.data.startswith(f"{CB_DEL_OK}:"))
     tg.cbq_handler(open_ignore, lambda c: c.data == CB_IGN)
+    tg.cbq_handler(open_quick, lambda c: c.data == CB_QUICK)
+    tg.cbq_handler(quick_toggle, lambda c: c.data.startswith(f"{CB_QTOGGLE}:"))
     tg.cbq_handler(ask_ignore_add, lambda c: c.data == CB_IGN_ADD)
     tg.cbq_handler(del_ignore, lambda c: c.data.startswith(f"{CB_IGN_DEL}:"))
     tg.cbq_handler(ask_rate, lambda c: c.data == CB_RATE)
