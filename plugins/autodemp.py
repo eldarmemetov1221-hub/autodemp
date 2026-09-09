@@ -74,6 +74,9 @@ DEFAULT_LOT = {
     "online_only": False,      # учитывать только онлайн-продавцов
     "min_reviews": 0,          # минимум отзывов у конкурента (0 = без ограничения)
     "keyword": "",             # текст, который должен быть в описании конкурента
+    # Агрессивный режим: при наличии конкурентов сразу вставать на MIN
+    # (гарантированно первый, минуя пошаговую гонку и лаг FunPay).
+    "aggressive": False,
 }
 
 # Стратегии, когда подходящих конкурентов нет (по умолчанию — не менять цену).
@@ -215,6 +218,7 @@ def load_config() -> None:
             except (TypeError, ValueError):
                 merged["min_reviews"] = 0
             merged["keyword"] = str(merged.get("keyword", "") or "")
+            merged["aggressive"] = bool(merged.get("aggressive", False))
             lots[str(lot_id)] = merged
         data["lots"] = lots
         try:
@@ -434,6 +438,7 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
     f_online = bool(lot_cfg.get("online_only", False))
     f_min_reviews = int(lot_cfg.get("min_reviews", 0) or 0)
     f_keyword = (lot_cfg.get("keyword", "") or "").strip().lower()
+    aggressive = bool(lot_cfg.get("aggressive", False))
 
     # Блокировка исключает одновременное изменение одного и того же лота.
     lock = _lot_lock(lot_id)
@@ -523,7 +528,11 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
         #    цене продавца при сохранении).
         target_b = None
         if valid:
-            target_b = min_comp_buyer - step_b
+            if aggressive:
+                # Гарантированно первый: сразу на нижнюю границу (MIN).
+                target_b = min_b
+            else:
+                target_b = min_comp_buyer - step_b
         elif strategy == "max":
             target_b = max_b if max_b > 0 else None
         elif strategy == "custom":
@@ -723,6 +732,7 @@ CB_RATE = "ADrate"      # ADrate
 CB_MODE = "ADmode"      # ADmode — переключить режим цены (продавец/покупатель)
 CB_DELIV = "ADdlv"      # ADdlv:<lot_id> — цикл фильтра доставки
 CB_ONLINE = "ADonl"     # ADonl:<lot_id> — вкл/выкл «только онлайн»
+CB_AGGR = "ADaggr"      # ADaggr:<lot_id> — вкл/выкл агрессивный режим
 
 # Состояния ввода (msg_handler по префиксу "AD:").
 ST_ADD = "AD:add"
@@ -817,6 +827,9 @@ def _register_telegram(cardinal: "Cardinal") -> None:
             B(f"Фильтр текста: {lot.get('keyword') or '—'}",
               callback_data=f"{CB_SET}:kw:{lot_id}"),
         )
+        kb.add(B(f"⚡ Агрессивный режим (всегда 1-й): "
+                 f"{'ВКЛ' if lot.get('aggressive') else 'выкл'}",
+                 callback_data=f"{CB_AGGR}:{lot_id}"))
         if lot.get("enabled"):
             kb.add(B("⏹ Остановить", callback_data=f"{CB_TOGGLE}:{lot_id}"))
         else:
@@ -872,6 +885,8 @@ def _register_telegram(cardinal: "Cardinal") -> None:
         if lot.get("keyword"):
             flt.append(f"текст «{lot['keyword']}»")
         lines.append(f"│ Фильтры: {', '.join(flt)}")
+        if lot.get("aggressive"):
+            lines.append("│ ⚡ Агрессивный режим: цена сразу на MIN")
         if err:
             lines.append(f"│ ⚠️ Ошибка: {err}")
         lines.append("└─")
@@ -956,6 +971,21 @@ def _register_telegram(cardinal: "Cardinal") -> None:
         save_config()
         _edit(call, text_lot(lot_id), kb_lot(lot_id))
         bot.answer_callback_query(call.id)
+
+    def toggle_aggressive(call: "CallbackQuery"):
+        lot_id = call.data.split(":", 1)[1]
+        with _CFG_LOCK:
+            lot = _CFG["lots"].get(lot_id)
+            if lot:
+                lot["aggressive"] = not lot.get("aggressive", False)
+                new = lot["aggressive"]
+        save_config()
+        _edit(call, text_lot(lot_id), kb_lot(lot_id))
+        bot.answer_callback_query(
+            call.id,
+            "Агрессивный режим включён: цена сразу опускается до MIN"
+            if new else "Агрессивный режим выключен",
+            show_alert=True)
 
     def toggle_lot(call: "CallbackQuery"):
         lot_id = call.data.split(":", 1)[1]
@@ -1161,6 +1191,7 @@ def _register_telegram(cardinal: "Cardinal") -> None:
     tg.cbq_handler(cycle_strategy, lambda c: c.data.startswith(f"{CB_STRAT}:"))
     tg.cbq_handler(cycle_delivery, lambda c: c.data.startswith(f"{CB_DELIV}:"))
     tg.cbq_handler(toggle_online, lambda c: c.data.startswith(f"{CB_ONLINE}:"))
+    tg.cbq_handler(toggle_aggressive, lambda c: c.data.startswith(f"{CB_AGGR}:"))
     tg.cbq_handler(toggle_lot, lambda c: c.data.startswith(f"{CB_TOGGLE}:"))
     tg.cbq_handler(confirm_delete, lambda c: c.data.startswith(f"{CB_DEL}:"))
     tg.cbq_handler(do_delete, lambda c: c.data.startswith(f"{CB_DEL_OK}:"))
