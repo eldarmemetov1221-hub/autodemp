@@ -96,10 +96,9 @@ MIN_SAFE_INTERVAL = 2.0        # сек — минимально безопас�
 COMP_CACHE_TTL = 1.5           # сек
 
 # Синхронизация с обновлением таблицы FunPay (экспериментально): плагин ловит
-# период обновления и меняет цену за SYNC_LEAD секунд до следующего снимка,
-# чтобы в него попала уже ваша свежая цена и вы оказались первым.
+# момент обновления таблицы и меняет цену через sync_delay секунд ПОСЛЕ него,
+# чтобы свежая цена попала в ближайший снимок и вы оказались первым.
 SYNC_POLL = 2.0                # частый опрос для отслеживания обновлений, сек
-SYNC_LEAD = 2.0                # за сколько секунд до обновления менять цену
 
 # Режим цены, в котором пользователь задаёт MIN/MAX/шаг и видит числа:
 #   "seller" — цена для продавца (как в таблице FunPay, по умолчанию);
@@ -117,8 +116,10 @@ DEFAULT_CONFIG = {
     # свежих цен конкурентов. Помогает НЕ во всех разделах и повышает нагрузку.
     "fast_check": False,
     # Экспериментально: синхронизация с обновлением таблицы FunPay —
-    # менять цену прямо перед следующим снимком, чтобы стоять первым.
+    # менять цену через sync_delay секунд ПОСЛЕ обновления таблицы, чтобы свежая
+    # цена попала в ближайший снимок (цикл нестатичный, ≥30с — привязка к событию).
     "sync_refresh": False,
+    "sync_delay": 7.0,           # сек после обновления таблицы до смены цены
     "lots": {},                  # {lot_id(str): {...}}
 }
 
@@ -255,6 +256,10 @@ def load_config() -> None:
             data["price_mode"] = "seller"
         data["fast_check"] = bool(data.get("fast_check", False))
         data["sync_refresh"] = bool(data.get("sync_refresh", False))
+        try:
+            data["sync_delay"] = max(0.0, float(data.get("sync_delay", 7.0)))
+        except (TypeError, ValueError):
+            data["sync_delay"] = 7.0
         _CFG = data
 
 
@@ -316,35 +321,25 @@ def _rate_register() -> None:
         _RATE_TIMES.append(time.time())
 
 
-def _refresh_track_and_gate(subcat_id, competitors) -> bool:
+def _refresh_track_and_gate(subcat_id, competitors, delay: float) -> bool:
     """
-    Отслеживает обновления таблицы по смене «отпечатка» цен конкурентов и
-    решает, пора ли менять цену. Возвращает True, если сейчас окно прямо перед
-    следующим обновлением (или данных о периоде ещё мало — тогда работаем как
-    обычно). Реализует идею «менять цену за пару секунд до снимка таблицы».
+    Отслеживает обновления таблицы по смене «отпечатка» цен конкурентов.
+    Возвращает True, если с момента последнего обновления прошло >= delay секунд
+    — то есть пора менять цену «через N секунд ПОСЛЕ обновления» (идея пользователя).
+    Цикл обновления у FunPay нестатичный, поэтому привязываемся к самому событию
+    обновления, а не пытаемся предсказать следующее.
     """
     fp = tuple(sorted(round(c.price, 2) for c in competitors if c.price is not None))
     now = time.time()
     with _REFRESH_LOCK:
-        tr = _REFRESH.setdefault(subcat_id, {"fp": None, "last": None, "gaps": deque(maxlen=8)})
+        tr = _REFRESH.setdefault(subcat_id, {"fp": None, "last_refresh": None})
         if tr["fp"] is not None and fp != tr["fp"]:
-            # Таблица обновилась (изменились цены конкурентов).
-            if tr["last"] is not None:
-                gap = now - tr["last"]
-                if 1.0 < gap < 120.0:
-                    tr["gaps"].append(gap)
-            tr["last"] = now
-        elif tr["last"] is None:
-            tr["last"] = now
+            tr["last_refresh"] = now         # таблица только что обновилась
+        elif tr["last_refresh"] is None:
+            tr["last_refresh"] = now         # инициализация
         tr["fp"] = fp
-        gaps = list(tr["gaps"])
-        last = tr["last"]
-    if len(gaps) < 3 or not last:
-        return True                      # период ещё не известен — работаем как обычно
-    period = sorted(gaps)[len(gaps) // 2]  # медиана периода обновления
-    predicted = last + period
-    # Меняем цену только в окне прямо перед предсказанным обновлением.
-    return (predicted - SYNC_LEAD) <= now <= (predicted + 0.5)
+        last = tr["last_refresh"]
+    return (now - last) >= delay
 
 
 def _safe_interval(interval: Any) -> float:
@@ -603,11 +598,12 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
 
             filtered.append(c)
 
-        # Синхронизация с обновлением таблицы (экспериментально): решаем, пора
-        # ли менять цену (в окне прямо перед следующим снимком таблицы).
+        # Синхронизация с обновлением таблицы (экспериментально): менять цену
+        # через sync_delay секунд ПОСЛЕ того, как таблица обновилась.
         with _CFG_LOCK:
             sync_on = bool(_CFG.get("sync_refresh", False))
-        apply_ok = (_refresh_track_and_gate(getattr(subcat, "id", None), filtered)
+            sync_delay = float(_CFG.get("sync_delay", 7.0))
+        apply_ok = (_refresh_track_and_gate(getattr(subcat, "id", None), filtered, sync_delay)
                     if sync_on else True)
 
         # 4. Подходят по диапазону — в цене ПОКУПАТЕЛЯ (c.price уже покупательская).
@@ -687,11 +683,11 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
                         f"{_fmt(current_price, symbol)}")
             return
 
-        # Синхронизация: изменение нужно, но ещё не окно перед обновлением —
-        # ждём, чтобы новая цена попала в ближайший снимок таблицы.
+        # Синхронизация: изменение нужно, но ещё не прошла задержка после
+        # обновления таблицы — ждём, чтобы новая цена попала в ближайший снимок.
         if not apply_ok:
-            logger.info(f"{LOGGER_PREFIX} Лот {lot_id}: изменение отложено до окна "
-                        f"перед обновлением таблицы (синхронизация).")
+            logger.info(f"{LOGGER_PREFIX} Лот {lot_id}: ждём {sync_delay:g} сек после "
+                        f"обновления таблицы (синхронизация).")
             return
 
         new_note = _fmt(target, symbol)
@@ -837,6 +833,7 @@ CB_RATE = "ADrate"      # ADrate
 CB_MODE = "ADmode"      # ADmode — переключить режим цены (продавец/покупатель)
 CB_FAST = "ADfast"      # ADfast — вкл/выкл экспериментальную «быструю проверку»
 CB_SYNC = "ADsync"      # ADsync — вкл/выкл синхронизацию с обновлением таблицы
+CB_SYNCDELAY = "ADsdl"  # ADsdl — задать задержку после обновления таблицы
 CB_DELIV = "ADdlv"      # ADdlv:<lot_id> — цикл фильтра доставки
 CB_ONLINE = "ADonl"     # ADonl:<lot_id> — вкл/выкл «только онлайн»
 CB_AGGR = "ADaggr"      # ADaggr:<lot_id> — вкл/выкл агрессивный режим
@@ -846,6 +843,7 @@ ST_ADD = "AD:add"
 ST_SET = "AD:set"        # AD:set:<param>:<lot_id>
 ST_IGN_ADD = "AD:igadd"
 ST_RATE = "AD:rate"
+ST_SYNCDELAY = "AD:syncdelay"
 
 
 def _register_telegram(cardinal: "Cardinal") -> None:
@@ -889,6 +887,11 @@ def _register_telegram(cardinal: "Cardinal") -> None:
                  callback_data=CB_FAST))
         kb.add(B(f"🕒 Синхр. с таблицей (эксп.): {'ВКЛ' if sync else 'выкл'}",
                  callback_data=CB_SYNC))
+        if sync:
+            with _CFG_LOCK:
+                sdelay = _CFG.get("sync_delay", 7.0)
+            kb.add(B(f"⏱ Задержка после обновления: {sdelay:g} сек",
+                     callback_data=CB_SYNCDELAY))
         kb.add(B(f"🛡 Лимит изм./мин: {rate}", callback_data=CB_RATE))
         kb.add(B("🚫 Игнор-список продавцов", callback_data=CB_IGN))
         kb.add(B("◀️ Назад", callback_data=f"{CBT.EDIT_PLUGIN}:{UUID}:0"
@@ -1216,6 +1219,11 @@ def _register_telegram(cardinal: "Cardinal") -> None:
         ask(call, ST_RATE,
             "Отправьте максимальное число <b>изменений цены в минуту</b> (например 10):")
 
+    def ask_syncdelay(call: "CallbackQuery"):
+        ask(call, ST_SYNCDELAY,
+            "Через сколько <b>секунд после обновления таблицы</b> менять цену? "
+            "(например 7; можно дробное)")
+
     def _refresh_card(chat_id: int, card_mid: int | None, text: str, kb):
         if card_mid is None:
             bot.send_message(chat_id, text, reply_markup=kb, parse_mode="HTML")
@@ -1325,6 +1333,18 @@ def _register_telegram(cardinal: "Cardinal") -> None:
             _refresh_card(message.chat.id, card_mid, text_main(), kb_main())
             return
 
+        if state == ST_SYNCDELAY:
+            try:
+                val = float(text.replace(",", "."))
+            except ValueError:
+                reply("❌ Нужно число (секунды), например 7.")
+                return
+            with _CFG_LOCK:
+                _CFG["sync_delay"] = max(0.0, val)
+            save_config()
+            _refresh_card(message.chat.id, card_mid, text_main(), kb_main())
+            return
+
     # ------------------------- регистрация ------------------------- #
     tg.cbq_handler(open_settings,
                    lambda c: c.data.startswith(f"{CBT.PLUGIN_SETTINGS}:{UUID}"))
@@ -1345,6 +1365,7 @@ def _register_telegram(cardinal: "Cardinal") -> None:
     tg.cbq_handler(toggle_mode, lambda c: c.data == CB_MODE)
     tg.cbq_handler(toggle_fast, lambda c: c.data == CB_FAST)
     tg.cbq_handler(toggle_sync, lambda c: c.data == CB_SYNC)
+    tg.cbq_handler(ask_syncdelay, lambda c: c.data == CB_SYNCDELAY)
 
     tg.msg_handler(
         handle_input,
