@@ -95,6 +95,12 @@ MIN_SAFE_INTERVAL = 2.0        # сек — минимально безопас�
 # обращений, когда несколько лотов относятся к одной подкатегории.
 COMP_CACHE_TTL = 1.5           # сек
 
+# Синхронизация с обновлением таблицы FunPay (экспериментально): плагин ловит
+# период обновления и меняет цену за SYNC_LEAD секунд до следующего снимка,
+# чтобы в него попала уже ваша свежая цена и вы оказались первым.
+SYNC_POLL = 2.0                # частый опрос для отслеживания обновлений, сек
+SYNC_LEAD = 2.0                # за сколько секунд до обновления менять цену
+
 # Режим цены, в котором пользователь задаёт MIN/MAX/шаг и видит числа:
 #   "seller" — цена для продавца (как в таблице FunPay, по умолчанию);
 #   "buyer"  — цена для покупателя (с комиссией FunPay). Конвертация точная,
@@ -110,6 +116,9 @@ DEFAULT_CONFIG = {
     # Экспериментально: обход серверного кэша FunPay (cache-buster) для более
     # свежих цен конкурентов. Помогает НЕ во всех разделах и повышает нагрузку.
     "fast_check": False,
+    # Экспериментально: синхронизация с обновлением таблицы FunPay —
+    # менять цену прямо перед следующим снимком, чтобы стоять первым.
+    "sync_refresh": False,
     "lots": {},                  # {lot_id(str): {...}}
 }
 
@@ -117,6 +126,12 @@ DEFAULT_CONFIG = {
 _COMM_CACHE: dict[tuple, tuple[float, float]] = {}   # key -> (timestamp, coeff)
 _COMM_CACHE_LOCK = threading.Lock()
 COMM_CACHE_TTL = 600.0        # сек — как часто перепроверять комиссию
+
+# Трекер обновлений таблицы по подкатегории (для sync_refresh):
+# {subcat_id: {"fp": последний отпечаток, "last": время посл. обновления,
+#              "gaps": последние периоды между обновлениями}}
+_REFRESH: dict[Any, dict] = {}
+_REFRESH_LOCK = threading.Lock()
 
 # --------------------------------------------------------------------------- #
 #                       Глобальное состояние времени выполнения               #
@@ -239,6 +254,7 @@ def load_config() -> None:
         if data.get("price_mode") not in PRICE_MODES:
             data["price_mode"] = "seller"
         data["fast_check"] = bool(data.get("fast_check", False))
+        data["sync_refresh"] = bool(data.get("sync_refresh", False))
         _CFG = data
 
 
@@ -298,6 +314,37 @@ def _rate_allow() -> bool:
 def _rate_register() -> None:
     with _RATE_LOCK:
         _RATE_TIMES.append(time.time())
+
+
+def _refresh_track_and_gate(subcat_id, competitors) -> bool:
+    """
+    Отслеживает обновления таблицы по смене «отпечатка» цен конкурентов и
+    решает, пора ли менять цену. Возвращает True, если сейчас окно прямо перед
+    следующим обновлением (или данных о периоде ещё мало — тогда работаем как
+    обычно). Реализует идею «менять цену за пару секунд до снимка таблицы».
+    """
+    fp = tuple(sorted(round(c.price, 2) for c in competitors if c.price is not None))
+    now = time.time()
+    with _REFRESH_LOCK:
+        tr = _REFRESH.setdefault(subcat_id, {"fp": None, "last": None, "gaps": deque(maxlen=8)})
+        if tr["fp"] is not None and fp != tr["fp"]:
+            # Таблица обновилась (изменились цены конкурентов).
+            if tr["last"] is not None:
+                gap = now - tr["last"]
+                if 1.0 < gap < 120.0:
+                    tr["gaps"].append(gap)
+            tr["last"] = now
+        elif tr["last"] is None:
+            tr["last"] = now
+        tr["fp"] = fp
+        gaps = list(tr["gaps"])
+        last = tr["last"]
+    if len(gaps) < 3 or not last:
+        return True                      # период ещё не известен — работаем как обычно
+    period = sorted(gaps)[len(gaps) // 2]  # медиана периода обновления
+    predicted = last + period
+    # Меняем цену только в окне прямо перед предсказанным обновлением.
+    return (predicted - SYNC_LEAD) <= now <= (predicted + 0.5)
 
 
 def _safe_interval(interval: Any) -> float:
@@ -556,6 +603,13 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
 
             filtered.append(c)
 
+        # Синхронизация с обновлением таблицы (экспериментально): решаем, пора
+        # ли менять цену (в окне прямо перед следующим снимком таблицы).
+        with _CFG_LOCK:
+            sync_on = bool(_CFG.get("sync_refresh", False))
+        apply_ok = (_refresh_track_and_gate(getattr(subcat, "id", None), filtered)
+                    if sync_on else True)
+
         # 4. Подходят по диапазону — в цене ПОКУПАТЕЛЯ (c.price уже покупательская).
         valid = [c for c in filtered
                  if c.price is not None and min_b <= c.price <= max_b]
@@ -633,6 +687,13 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
                         f"{_fmt(current_price, symbol)}")
             return
 
+        # Синхронизация: изменение нужно, но ещё не окно перед обновлением —
+        # ждём, чтобы новая цена попала в ближайший снимок таблицы.
+        if not apply_ok:
+            logger.info(f"{LOGGER_PREFIX} Лот {lot_id}: изменение отложено до окна "
+                        f"перед обновлением таблицы (синхронизация).")
+            return
+
         new_note = _fmt(target, symbol)
         if mode == "buyer":
             new_note += f" (покупатель) → {_fmt(target_seller, symbol)} продавцу"
@@ -686,7 +747,11 @@ def _worker_loop(cardinal: "Cardinal", lot_id: str, stop: "threading.Event") -> 
                 break
             continue
 
-        interval = _safe_interval(lot_cfg.get("interval", MIN_SAFE_INTERVAL))
+        with _CFG_LOCK:
+            sync_on = bool(_CFG.get("sync_refresh", False))
+        # В режиме синхронизации опрашиваем часто (чтобы поймать окно обновления).
+        interval = SYNC_POLL if sync_on else _safe_interval(
+            lot_cfg.get("interval", MIN_SAFE_INTERVAL))
         try:
             _process_lot_once(cardinal, lot_id, stop)
         except RuntimeError as e:
@@ -771,6 +836,7 @@ CB_IGN_DEL = "ADigdel"  # ADigdel:<seller_id>
 CB_RATE = "ADrate"      # ADrate
 CB_MODE = "ADmode"      # ADmode — переключить режим цены (продавец/покупатель)
 CB_FAST = "ADfast"      # ADfast — вкл/выкл экспериментальную «быструю проверку»
+CB_SYNC = "ADsync"      # ADsync — вкл/выкл синхронизацию с обновлением таблицы
 CB_DELIV = "ADdlv"      # ADdlv:<lot_id> — цикл фильтра доставки
 CB_ONLINE = "ADonl"     # ADonl:<lot_id> — вкл/выкл «только онлайн»
 CB_AGGR = "ADaggr"      # ADaggr:<lot_id> — вкл/выкл агрессивный режим
@@ -816,10 +882,13 @@ def _register_telegram(cardinal: "Cardinal") -> None:
         with _CFG_LOCK:
             mode = _CFG.get("price_mode", "seller")
             fast = _CFG.get("fast_check", False)
+            sync = _CFG.get("sync_refresh", False)
         kb.add(B("➕ Добавить лот", callback_data=CB_ADD))
         kb.add(B(f"💱 Цены: {PRICE_MODE_TITLES.get(mode)}", callback_data=CB_MODE))
         kb.add(B(f"⚡ Быстрая проверка (эксп.): {'ВКЛ' if fast else 'выкл'}",
                  callback_data=CB_FAST))
+        kb.add(B(f"🕒 Синхр. с таблицей (эксп.): {'ВКЛ' if sync else 'выкл'}",
+                 callback_data=CB_SYNC))
         kb.add(B(f"🛡 Лимит изм./мин: {rate}", callback_data=CB_RATE))
         kb.add(B("🚫 Игнор-список продавцов", callback_data=CB_IGN))
         kb.add(B("◀️ Назад", callback_data=f"{CBT.EDIT_PLUGIN}:{UUID}:0"
@@ -833,11 +902,13 @@ def _register_telegram(cardinal: "Cardinal") -> None:
             ign = _CFG.get("ignored_sellers", [])
             mode = _CFG.get("price_mode", "seller")
             fast = _CFG.get("fast_check", False)
+            sync = _CFG.get("sync_refresh", False)
         return (
             "🤖 <b>AutoDemp — автодемпинг</b>\n\n"
             f"Лотов настроено: <b>{len(lots)}</b>\n"
             f"Режим цены: <b>{PRICE_MODE_TITLES.get(mode)}</b>\n"
             f"Быстрая проверка: <b>{'ВКЛ' if fast else 'выкл'}</b>\n"
+            f"Синхр. с таблицей: <b>{'ВКЛ' if sync else 'выкл'}</b>\n"
             f"Лимит изменений цены: <b>{rate}/мин</b>\n"
             f"Игнорируется продавцов: <b>{len(ign)}</b>\n\n"
             "Выберите лот для настройки или добавьте новый."
@@ -997,6 +1068,19 @@ def _register_telegram(cardinal: "Cardinal") -> None:
             "Быстрая проверка ВКЛ: обход кэша FunPay (свежее цены, но выше "
             "нагрузка). Проверьте, стало ли быстрее." if new
             else "Быстрая проверка выключена",
+            show_alert=True)
+
+    def toggle_sync(call: "CallbackQuery"):
+        with _CFG_LOCK:
+            _CFG["sync_refresh"] = not _CFG.get("sync_refresh", False)
+            new = _CFG["sync_refresh"]
+        save_config()
+        _edit(call, text_main(), kb_main())
+        bot.answer_callback_query(
+            call.id,
+            "Синхронизация ВКЛ: плагин ловит период обновления таблицы и меняет "
+            "цену прямо перед снимком — чтобы стоять первым. Дайте ~минуту на "
+            "подстройку." if new else "Синхронизация с таблицей выключена",
             show_alert=True)
 
     def cycle_strategy(call: "CallbackQuery"):
@@ -1260,6 +1344,7 @@ def _register_telegram(cardinal: "Cardinal") -> None:
     tg.cbq_handler(ask_rate, lambda c: c.data == CB_RATE)
     tg.cbq_handler(toggle_mode, lambda c: c.data == CB_MODE)
     tg.cbq_handler(toggle_fast, lambda c: c.data == CB_FAST)
+    tg.cbq_handler(toggle_sync, lambda c: c.data == CB_SYNC)
 
     tg.msg_handler(
         handle_input,
