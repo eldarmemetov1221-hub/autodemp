@@ -83,12 +83,25 @@ MIN_SAFE_INTERVAL = 2.0        # сек — минимально безопас�
 # обращений, когда несколько лотов относятся к одной подкатегории.
 COMP_CACHE_TTL = 1.5           # сек
 
+# Режим цены, в котором пользователь задаёт MIN/MAX/шаг и видит числа:
+#   "seller" — цена для продавца (как в таблице FunPay, по умолчанию);
+#   "buyer"  — цена для покупателя (с комиссией FunPay). Конвертация точная,
+#              по коэффициенту комиссии из FunPay (CalcResult).
+PRICE_MODES = ("seller", "buyer")
+PRICE_MODE_TITLES = {"seller": "для продавца", "buyer": "для покупателя"}
+
 # Значения по умолчанию для всего плагина.
 DEFAULT_CONFIG = {
     "max_changes_per_min": 10,   # защита от ценовой войны
     "ignored_sellers": [],       # id продавцов, чьи лоты игнорируются
+    "price_mode": "seller",      # seller | buyer
     "lots": {},                  # {lot_id(str): {...}}
 }
+
+# Кэш коэффициента комиссии по подкатегории (комиссия стабильна, обновляем редко).
+_COMM_CACHE: dict[tuple, tuple[float, float]] = {}   # key -> (timestamp, coeff)
+_COMM_CACHE_LOCK = threading.Lock()
+COMM_CACHE_TTL = 600.0        # сек — как часто перепроверять комиссию
 
 # --------------------------------------------------------------------------- #
 #                       Глобальное состояние времени выполнения               #
@@ -195,6 +208,8 @@ def load_config() -> None:
             data["max_changes_per_min"] = max(1, int(data.get("max_changes_per_min", 10)))
         except Exception:
             data["max_changes_per_min"] = 10
+        if data.get("price_mode") not in PRICE_MODES:
+            data["price_mode"] = "seller"
         _CFG = data
 
 
@@ -272,6 +287,53 @@ def _fetch_lock(key: tuple) -> threading.Lock:
             lock = threading.Lock()
             _COMP_FETCH_LOCKS[key] = lock
         return lock
+
+
+def _coeff_from_calc(calc_result) -> float | None:
+    """Достаёт коэффициент комиссии (цена_покупателя / цена_продавца)."""
+    if calc_result is None:
+        return None
+    k = getattr(calc_result, "commission_coefficient", None)
+    try:
+        k = float(k)
+    except (TypeError, ValueError):
+        return None
+    return k if k > 0 else None
+
+
+def _commission_coefficient(account, lf, subcat, stop: "threading.Event") -> float | None:
+    """
+    Коэффициент комиссии FunPay для подкатегории (buyer = seller * k).
+    Источники по приоритету: поля лота -> account.calc() -> кэш.
+    Возвращает None, если получить не удалось (тогда buyer-режим пропускает цикл,
+    чтобы не выставить неверную цену).
+    """
+    key = (subcat.type, subcat.id)
+    # 1. Из полей лота (без доп. запроса).
+    k = _coeff_from_calc(getattr(lf, "calc_result", None))
+    # 2. Через account.calc(), если в полях нет и кэш устарел.
+    if k is None:
+        now = time.time()
+        with _COMM_CACHE_LOCK:
+            cached = _COMM_CACHE.get(key)
+        if cached and now - cached[0] <= COMM_CACHE_TTL:
+            return cached[1]
+        try:
+            base = lf.price if getattr(lf, "price", None) else 1000
+            calc = _call_with_retry(account.calc, subcat.type, subcat.id,
+                                    stop=stop, price=base)
+            k = _coeff_from_calc(calc)
+        except Exception as e:
+            logger.warning(f"{LOGGER_PREFIX} Не удалось рассчитать комиссию: {e}")
+            k = None
+    if k is not None:
+        with _COMM_CACHE_LOCK:
+            _COMM_CACHE[key] = (time.time(), k)
+        return k
+    # 3. Последнее известное значение из кэша (лучше, чем ничего).
+    with _COMM_CACHE_LOCK:
+        cached = _COMM_CACHE.get(key)
+    return cached[1] if cached else None
 
 
 def _get_competitors(account, subcat, stop: "threading.Event"):
@@ -360,7 +422,7 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
     try:
         # 1. Текущая цена и поля лота (одним запросом, переиспользуем для save).
         lf = _call_with_retry(account.get_lot_fields, int(lot_id), stop=stop)
-        current_price = lf.price
+        current_seller = lf.price
         symbol = _currency_symbol(getattr(lf, "currency", None))
 
         subcat = getattr(lf, "subcategory", None)
@@ -368,6 +430,24 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
             logger.error(f"{LOGGER_PREFIX} Лот {lot_id}: не удалось определить подкатегорию.")
             _set_stat(lot_id, error="нет подкатегории", updated=time.time())
             return
+
+        # Режим цены и коэффициент комиссии FunPay (buyer = seller * k).
+        with _CFG_LOCK:
+            mode = _CFG.get("price_mode", "seller")
+        k = 1.0
+        if mode == "buyer":
+            k = _commission_coefficient(account, lf, subcat, stop)
+            if not k:
+                logger.error(
+                    f"{LOGGER_PREFIX} Лот {lot_id}: не удалось получить комиссию "
+                    f"FunPay — цикл пропущен (режим «для покупателя»)."
+                )
+                _set_stat(lot_id, error="нет данных о комиссии", updated=time.time())
+                return
+
+        # Всё, что видит/вводит пользователь — в его единицах (buyer или seller);
+        # в FunPay сохраняется цена продавца. current_price — для отображения.
+        current_price = current_seller * k
 
         # 2. Конкуренты в подкатегории (с кэшем и дедупликацией запросов).
         competitors = _get_competitors(account, subcat, stop)
@@ -390,76 +470,95 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
                 continue                      # лот недоступен (нет в наличии)
             filtered.append(c)
 
-        # 4. Подходят по диапазону [min_price, max_price].
+        # 4. Подходят по диапазону [min_price, max_price] (в единицах пользователя:
+        #    цена конкурента-продавца переводится в те же единицы через * k).
         valid = [c for c in filtered
-                 if c.price is not None and min_price <= c.price <= max_price]
+                 if c.price is not None and min_price <= c.price * k <= max_price]
 
         total_found = len(filtered)
         valid_count = len(valid)
-        min_comp = min((c.price for c in valid), default=None)
+        min_comp_seller = min((c.price for c in valid), default=None)
+        min_comp = min_comp_seller * k if min_comp_seller is not None else None
 
-        # 5. Целевая цена.
+        # 5. Целевая цена (в единицах пользователя; без раннего округления —
+        #    финальное округление делаем уже в цене продавца).
+        target = None
         if valid:
-            target = round(min_comp - step, 2)
-            if target < min_price:
-                target = round(min_price, 2)     # защита: не ниже MIN PRICE
-        else:
-            # Нет подходящих конкурентов — применяем выбранную стратегию.
-            if strategy == "max":
-                target = round(max_price, 2) if max_price > 0 else None
-            elif strategy == "custom":
-                target = round(custom_price, 2) if custom_price > 0 else None
-            else:  # keep (по умолчанию) — не менять цену
-                target = None
-            # Стратегийную цену тоже держим в пределах [min_price, max_price].
-            if target is not None:
-                if min_price > 0:
-                    target = max(target, round(min_price, 2))
-                if max_price > 0:
-                    target = min(target, round(max_price, 2))
+            target = min_comp - step
+        elif strategy == "max":
+            target = max_price if max_price > 0 else None
+        elif strategy == "custom":
+            target = custom_price if custom_price > 0 else None
+        # keep (по умолчанию) — target остаётся None (не менять цену).
+        # Держим цель в пределах [min_price, max_price].
+        if target is not None:
+            if min_price > 0:
+                target = max(target, min_price)     # защита: не ниже MIN PRICE
+            if max_price > 0:
+                target = min(target, max_price)
 
         _set_stat(
             lot_id,
             current_price=current_price, competitors=total_found,
             valid=valid_count, min_comp=min_comp, target=target,
-            symbol=symbol, error=None, updated=time.time(),
+            symbol=symbol, mode=mode, error=None, updated=time.time(),
         )
 
+        mode_note = " (цены для покупателя)" if mode == "buyer" else ""
         header = (
-            f"Lot {lot_id}\n"
+            f"Lot {lot_id}{mode_note}\n"
             f"Найдены конкуренты: {total_found}\n"
             f"Подходят по диапазону: {valid_count}\n"
             f"Минимальная цена конкурента: {_fmt(min_comp, symbol)}\n"
             f"Текущая цена: {_fmt(current_price, symbol)}"
         )
 
-        # 6. Меняем цену, если нужно.
-        if target is None or _prices_equal(target, current_price):
+        # 6. Меняем цену, если нужно. В FunPay сохраняется цена продавца,
+        #    поэтому целевую цену переводим обратно в seller-единицы (/ k).
+        target_seller = round(target / k, 2) if target is not None else None
+        cur_seller_r = round(current_seller, 2)
+
+        # Гарантируем реальный подрез в цене продавца (FunPay ранжирует по ней,
+        # шаг 0.01): из-за округления цель не должна оказаться >= конкурента.
+        if target_seller is not None and valid and min_comp_seller is not None:
+            mcs = round(min_comp_seller, 2)
+            if target_seller >= mcs:
+                target_seller = round(mcs - 0.01, 2)
+            if min_price > 0:                       # но не ниже нижнего предела
+                floor_seller = round(min_price / k, 2)
+                if target_seller < floor_seller:
+                    target_seller = floor_seller
+
+        if target_seller is None or _prices_equal(target_seller, cur_seller_r):
             logger.info(f"{LOGGER_PREFIX} {header}\nЦена уже оптимальна: "
                         f"{_fmt(current_price, symbol)}")
             return
 
+        new_note = _fmt(target, symbol)
+        if mode == "buyer":
+            new_note += f" (покупатель) → {_fmt(target_seller, symbol)} продавцу"
+
         # Защита от ценовой войны — лимит изменений в минуту.
         if not _rate_allow():
             logger.warning(
-                f"{LOGGER_PREFIX} {header}\nНовая цена: {_fmt(target, symbol)}\n"
+                f"{LOGGER_PREFIX} {header}\nНовая цена: {new_note}\n"
                 f"Пропуск: превышен лимит изменений цены в минуту "
                 f"({_CFG.get('max_changes_per_min')})."
             )
             return
 
         try:
-            lf.price = float(target)
+            lf.price = float(target_seller)
             # renew_fields внутри save_lot синхронизирует поля; дублируем явно.
             try:
-                lf.fields["price"] = str(target)
+                lf.fields["price"] = str(target_seller)
             except Exception:
                 pass
             _call_with_retry(account.save_lot, lf, stop=stop)
             _rate_register()
-            _set_stat(lot_id, current_price=target, updated=time.time())
+            _set_stat(lot_id, current_price=target_seller * k, updated=time.time())
             logger.info(
-                f"{LOGGER_PREFIX} {header}\nНовая цена: {_fmt(target, symbol)}\n"
+                f"{LOGGER_PREFIX} {header}\nНовая цена: {new_note}\n"
                 f"Цена изменена успешно"
             )
         except Exception as e:
@@ -571,6 +670,7 @@ CB_IGN = "ADign"        # ADign
 CB_IGN_ADD = "ADigadd"  # ADigadd
 CB_IGN_DEL = "ADigdel"  # ADigdel:<seller_id>
 CB_RATE = "ADrate"      # ADrate
+CB_MODE = "ADmode"      # ADmode — переключить режим цены (продавец/покупатель)
 
 # Состояния ввода (msg_handler по префиксу "AD:").
 ST_ADD = "AD:add"
@@ -610,7 +710,10 @@ def _register_telegram(cardinal: "Cardinal") -> None:
             if price is not None:
                 label += f" | {_fmt(price, sym)}"
             kb.add(B(label, callback_data=f"{CB_LOT}:{lot_id}"))
+        with _CFG_LOCK:
+            mode = _CFG.get("price_mode", "seller")
         kb.add(B("➕ Добавить лот", callback_data=CB_ADD))
+        kb.add(B(f"💱 Цены: {PRICE_MODE_TITLES.get(mode)}", callback_data=CB_MODE))
         kb.add(B(f"🛡 Лимит изм./мин: {rate}", callback_data=CB_RATE))
         kb.add(B("🚫 Игнор-список продавцов", callback_data=CB_IGN))
         kb.add(B("◀️ Назад", callback_data=f"{CBT.EDIT_PLUGIN}:{UUID}:0"
@@ -622,9 +725,11 @@ def _register_telegram(cardinal: "Cardinal") -> None:
             lots = _CFG["lots"]
             rate = _CFG.get("max_changes_per_min", 10)
             ign = _CFG.get("ignored_sellers", [])
+            mode = _CFG.get("price_mode", "seller")
         return (
             "🤖 <b>AutoDemp — автодемпинг</b>\n\n"
             f"Лотов настроено: <b>{len(lots)}</b>\n"
+            f"Режим цены: <b>{PRICE_MODE_TITLES.get(mode)}</b>\n"
             f"Лимит изменений цены: <b>{rate}/мин</b>\n"
             f"Игнорируется продавцов: <b>{len(ign)}</b>\n\n"
             "Выберите лот для настройки или добавьте новый."
@@ -664,6 +769,8 @@ def _register_telegram(cardinal: "Cardinal") -> None:
             return "Лот не найден."
         st = _get_stat(lot_id)
         sym = st.get("symbol", "₽")
+        with _CFG_LOCK:
+            mode = _CFG.get("price_mode", "seller")
         status = "🟢 Работает" if lot.get("enabled") else "🔴 Остановлен"
         cur = _fmt(st.get("current_price"), sym)
         comp = st.get("competitors", "—")
@@ -674,6 +781,7 @@ def _register_telegram(cardinal: "Cardinal") -> None:
             "┌─ <b>Автодэмпинг</b> ─",
             f"│ Lot ID: <code>{lot_id}</code>",
             f"│ Статус: {status}",
+            f"│ Цены: <b>{PRICE_MODE_TITLES.get(mode)}</b>",
             "│",
             f"│ Минимальная цена: {_fmt(lot['min_price'], sym)}",
             f"│ Максимальная цена: {_fmt(lot['max_price'], sym)}",
@@ -727,6 +835,16 @@ def _register_telegram(cardinal: "Cardinal") -> None:
     def open_ignore(call: "CallbackQuery"):
         _edit(call, text_ignore(), kb_ignore())
         bot.answer_callback_query(call.id)
+
+    def toggle_mode(call: "CallbackQuery"):
+        with _CFG_LOCK:
+            cur = _CFG.get("price_mode", "seller")
+            _CFG["price_mode"] = "buyer" if cur == "seller" else "seller"
+            new = _CFG["price_mode"]
+        save_config()
+        _edit(call, text_main(), kb_main())
+        bot.answer_callback_query(
+            call.id, f"Режим цены: {PRICE_MODE_TITLES.get(new)}", show_alert=True)
 
     def cycle_strategy(call: "CallbackQuery"):
         lot_id = call.data.split(":", 1)[1]
@@ -932,6 +1050,7 @@ def _register_telegram(cardinal: "Cardinal") -> None:
     tg.cbq_handler(ask_ignore_add, lambda c: c.data == CB_IGN_ADD)
     tg.cbq_handler(del_ignore, lambda c: c.data.startswith(f"{CB_IGN_DEL}:"))
     tg.cbq_handler(ask_rate, lambda c: c.data == CB_RATE)
+    tg.cbq_handler(toggle_mode, lambda c: c.data == CB_MODE)
 
     tg.msg_handler(
         handle_input,
