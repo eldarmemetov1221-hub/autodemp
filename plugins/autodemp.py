@@ -61,17 +61,26 @@ DEFAULT_LOT = {
     "min_price": 0.0,          # нижняя граница (никогда не опускаемся ниже)
     "max_price": 0.0,          # верхняя граница диапазона учёта конкурентов
     "step": 0.01,              # на сколько опускаемся ниже конкурента
-    "interval": 60,            # период проверки, сек
-    "no_competitor_strategy": "max",  # max | keep | min
+    "interval": 5.0,           # период проверки, сек (поддерживает дробные)
+    "no_competitor_strategy": "keep",  # keep | max | custom
+    "custom_price": 0.0,       # цена для стратегии "custom"
 }
 
-# Стратегии, когда подходящих конкурентов нет.
-NO_COMP_STRATEGIES = ("max", "keep", "min")
+# Стратегии, когда подходящих конкурентов нет (по умолчанию — не менять цену).
+NO_COMP_STRATEGIES = ("keep", "max", "custom")
 NO_COMP_TITLES = {
-    "max": "макс. цена",
     "keep": "не менять",
-    "min": "мин. цена",
+    "max": "макс. цена",
+    "custom": "заданная цена",
 }
+
+# Технические ограничения FunPay: слишком частые запросы приводят к блокировке.
+# Плагин не опускается ниже безопасного интервала, даже если пользователь
+# запросил меньше (п.9 ТЗ — использовать макс. допустимый безопасный интервал).
+MIN_SAFE_INTERVAL = 2.0        # сек — минимально безопасный период проверки
+# Короткий кэш списка конкурентов: дедуп одинаковых запросов и экономия
+# обращений, когда несколько лотов относятся к одной подкатегории.
+COMP_CACHE_TTL = 1.5           # сек
 
 # Значения по умолчанию для всего плагина.
 DEFAULT_CONFIG = {
@@ -95,6 +104,12 @@ _STATS: dict[str, dict[str, Any]] = {}     # lot_id -> {...}
 # Глобальный лимитер изменений цены (защита от ценовой войны / зацикливания).
 _RATE_TIMES: deque = deque()
 _RATE_LOCK = threading.Lock()
+
+# Кэш конкурентов по подкатегории + per-key блокировка (дедуп одинаковых
+# одновременных запросов, п.9 ТЗ). {key: (timestamp, lots)}
+_COMP_CACHE: dict[tuple, tuple[float, list]] = {}
+_COMP_CACHE_LOCK = threading.Lock()
+_COMP_FETCH_LOCKS: dict[tuple, threading.Lock] = {}
 
 _CARDINAL: "Cardinal | None" = None
 
@@ -164,7 +179,11 @@ def load_config() -> None:
             if isinstance(lot, dict):
                 merged.update({k: v for k, v in lot.items() if k in DEFAULT_LOT})
             if merged["no_competitor_strategy"] not in NO_COMP_STRATEGIES:
-                merged["no_competitor_strategy"] = "max"
+                merged["no_competitor_strategy"] = "keep"
+            try:
+                merged["interval"] = float(merged.get("interval", MIN_SAFE_INTERVAL))
+            except (TypeError, ValueError):
+                merged["interval"] = MIN_SAFE_INTERVAL
             lots[str(lot_id)] = merged
         data["lots"] = lots
         try:
@@ -236,6 +255,53 @@ def _rate_register() -> None:
         _RATE_TIMES.append(time.time())
 
 
+def _safe_interval(interval: Any) -> float:
+    """Ограничивает интервал снизу безопасным минимумом (п.9 ТЗ)."""
+    try:
+        value = float(interval)
+    except (TypeError, ValueError):
+        value = MIN_SAFE_INTERVAL
+    return max(MIN_SAFE_INTERVAL, value)
+
+
+def _fetch_lock(key: tuple) -> threading.Lock:
+    with _COMP_CACHE_LOCK:
+        lock = _COMP_FETCH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _COMP_FETCH_LOCKS[key] = lock
+        return lock
+
+
+def _get_competitors(account, subcat, stop: "threading.Event"):
+    """
+    Возвращает список публичных лотов подкатегории с коротким кэшированием.
+    Дедуплицирует одинаковые одновременные запросы: пока один поток тянет
+    данные, остальные ждут и берут результат из кэша (п.9 ТЗ).
+    """
+    key = (subcat.type, subcat.id)
+    now = time.time()
+    with _COMP_CACHE_LOCK:
+        entry = _COMP_CACHE.get(key)
+        if entry and now - entry[0] <= COMP_CACHE_TTL:
+            return entry[1]
+
+    lock = _fetch_lock(key)
+    with lock:
+        # Повторная проверка: пока ждали лок, другой поток мог обновить кэш.
+        now = time.time()
+        with _COMP_CACHE_LOCK:
+            entry = _COMP_CACHE.get(key)
+            if entry and now - entry[0] <= COMP_CACHE_TTL:
+                return entry[1]
+        lots = _call_with_retry(
+            account.get_subcategory_public_lots, subcat.type, subcat.id, stop=stop
+        )
+        with _COMP_CACHE_LOCK:
+            _COMP_CACHE[key] = (time.time(), lots)
+        return lots
+
+
 # --------------------------------------------------------------------------- #
 #                          Работа с FunPay (с ретраями)                        #
 # --------------------------------------------------------------------------- #
@@ -283,6 +349,7 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
     max_price = float(lot_cfg["max_price"])
     step = float(lot_cfg["step"])
     strategy = lot_cfg["no_competitor_strategy"]
+    custom_price = float(lot_cfg.get("custom_price", 0.0))
 
     # Блокировка исключает одновременное изменение одного и того же лота.
     lock = _lot_lock(lot_id)
@@ -301,10 +368,8 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
             _set_stat(lot_id, error="нет подкатегории", updated=time.time())
             return
 
-        # 2. Конкуренты в подкатегории.
-        competitors = _call_with_retry(
-            account.get_subcategory_public_lots, subcat.type, subcat.id, stop=stop
-        )
+        # 2. Конкуренты в подкатегории (с кэшем и дедупликацией запросов).
+        competitors = _get_competitors(account, subcat, stop)
 
         # 3. Исключаем свои лоты и игнорируемых продавцов.
         my_id = getattr(account, "id", None)
@@ -319,6 +384,9 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
                 continue                      # мой собственный лот
             if seller_id in ignored:
                 continue                      # игнорируемый продавец
+            amount = getattr(c, "amount", None)
+            if amount is not None and amount == 0:
+                continue                      # лот недоступен (нет в наличии)
             filtered.append(c)
 
         # 4. Подходят по диапазону [min_price, max_price].
@@ -338,10 +406,16 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
             # Нет подходящих конкурентов — применяем выбранную стратегию.
             if strategy == "max":
                 target = round(max_price, 2) if max_price > 0 else None
-            elif strategy == "min":
-                target = round(min_price, 2) if min_price > 0 else None
-            else:  # keep
+            elif strategy == "custom":
+                target = round(custom_price, 2) if custom_price > 0 else None
+            else:  # keep (по умолчанию) — не менять цену
                 target = None
+            # Стратегийную цену тоже держим в пределах [min_price, max_price].
+            if target is not None:
+                if min_price > 0:
+                    target = max(target, round(min_price, 2))
+                if max_price > 0:
+                    target = min(target, round(max_price, 2))
 
         _set_stat(
             lot_id,
@@ -413,7 +487,7 @@ def _worker_loop(cardinal: "Cardinal", lot_id: str, stop: "threading.Event") -> 
                 break
             continue
 
-        interval = max(1, int(lot_cfg.get("interval", 60)))
+        interval = _safe_interval(lot_cfg.get("interval", MIN_SAFE_INTERVAL))
         try:
             _process_lot_once(cardinal, lot_id, stop)
         except RuntimeError as e:
@@ -564,10 +638,14 @@ def _register_telegram(cardinal: "Cardinal") -> None:
         )
         kb.row(
             B(f"Шаг: {_fmt(lot['step'])}", callback_data=f"{CB_SET}:step:{lot_id}"),
-            B(f"Интервал: {int(lot['interval'])}с", callback_data=f"{CB_SET}:int:{lot_id}"),
+            B(f"Интервал: {'%g' % _safe_interval(lot['interval'])}с",
+              callback_data=f"{CB_SET}:int:{lot_id}"),
         )
         kb.add(B(f"Без конкурентов: {NO_COMP_TITLES.get(lot['no_competitor_strategy'])}",
                  callback_data=f"{CB_STRAT}:{lot_id}"))
+        if lot["no_competitor_strategy"] == "custom":
+            kb.add(B(f"Заданная цена: {_fmt(lot.get('custom_price', 0.0))}",
+                     callback_data=f"{CB_SET}:cprice:{lot_id}"))
         if lot.get("enabled"):
             kb.add(B("⏹ Остановить", callback_data=f"{CB_TOGGLE}:{lot_id}"))
         else:
@@ -599,7 +677,7 @@ def _register_telegram(cardinal: "Cardinal") -> None:
             f"│ Минимальная цена: {_fmt(lot['min_price'], sym)}",
             f"│ Максимальная цена: {_fmt(lot['max_price'], sym)}",
             f"│ Шаг: {_fmt(lot['step'], sym)}",
-            f"│ Интервал: {int(lot['interval'])} сек",
+            f"│ Интервал: {'%g' % _safe_interval(lot['interval'])} сек",
             "│",
             f"│ Текущая цена: {cur}",
             f"│ Конкурентов: {comp}",
@@ -727,7 +805,8 @@ def _register_telegram(cardinal: "Cardinal") -> None:
     def ask_set(call: "CallbackQuery"):
         _, param, lot_id = call.data.split(":", 2)
         titles = {"min": "минимальную цену", "max": "максимальную цену",
-                  "step": "шаг снижения", "int": "интервал проверки (сек)"}
+                  "step": "шаг снижения", "int": "интервал проверки (сек, можно дробный)",
+                  "cprice": "заданную цену (стратегия «без конкурентов»)"}
         m = bot.send_message(call.message.chat.id,
                              f"Отправьте новое значение — {titles.get(param, param)}:")
         tg.set_state(m.chat.id, m.id, call.from_user.id, f"{ST_SET}:{param}:{lot_id}",
@@ -803,8 +882,10 @@ def _register_telegram(cardinal: "Cardinal") -> None:
                     lot["max_price"] = max(0.0, round(num, 2))
                 elif param == "step":
                     lot["step"] = max(0.01, round(num, 2))
+                elif param == "cprice":
+                    lot["custom_price"] = max(0.0, round(num, 2))
                 elif param == "int":
-                    lot["interval"] = max(1, int(num))
+                    lot["interval"] = _safe_interval(num)
             save_config()
             _refresh_card(message.chat.id, card_mid, text_lot(lot_id), kb_lot(lot_id))
             return
