@@ -42,7 +42,7 @@ DESCRIPTION = (
     "границу (MIN PRICE) и лимит изменений цены в минуту. Игнор-список "
     "продавцов, исключение своих лотов, подробные логи и настройка из Telegram."
 )
-CREDITS = "@autodemp"
+CREDITS = "@R_memetovMsk"
 UUID = "b0f6e9a2-9d7e-4c8a-8b1f-3a2d7c4e5f10"
 SETTINGS_PAGE = True
 
