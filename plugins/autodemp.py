@@ -20,6 +20,7 @@ AutoDemp — плагин автодемпинга цен для FunPayCardinal 
 from __future__ import annotations
 
 import os
+import re
 import json
 import time
 import logging
@@ -850,9 +851,13 @@ def _register_telegram(cardinal: "Cardinal") -> None:
             bot.send_message(message.chat.id, t, parse_mode="HTML")
 
         if state == ST_ADD:
-            lot_id = text.replace(" ", "")
+            # Принимаем как чистый ID, так и ссылку вида
+            # https://funpay.com/lots/offer?id=75751254
+            m = re.search(r"id=(\d+)", text)
+            lot_id = m.group(1) if m else text.replace(" ", "")
             if not lot_id.isdigit():
-                reply("❌ Lot ID должен быть числом. Попробуйте снова.")
+                reply("❌ Отправьте числовой Lot ID (например 75751254) "
+                      "или ссылку на лот. Попробуйте снова.")
                 return
             with _CFG_LOCK:
                 if lot_id in _CFG["lots"]:
