@@ -56,6 +56,10 @@ LOGGER_PREFIX = "[AutoDemp]"
 CONFIG_DIR = os.path.join("storage", "plugins")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "autodemp.json")
 
+# Фильтр конкурентов по способу доставки (определяется по тексту лота).
+DELIVERY_MODES = ("all", "id", "code")
+DELIVERY_TITLES = {"all": "все", "id": "по ID", "code": "по коду"}
+
 # Значения по умолчанию для нового лота.
 DEFAULT_LOT = {
     "enabled": False,          # запущен ли демпинг по этому лоту
@@ -65,6 +69,11 @@ DEFAULT_LOT = {
     "interval": 5.0,           # период проверки, сек (поддерживает дробные)
     "no_competitor_strategy": "keep",  # keep | max | custom
     "custom_price": 0.0,       # цена для стратегии "custom"
+    # --- фильтры конкурентов ---
+    "delivery": "all",         # all | id | code (способ выдачи)
+    "online_only": False,      # учитывать только онлайн-продавцов
+    "min_reviews": 0,          # минимум отзывов у конкурента (0 = без ограничения)
+    "keyword": "",             # текст, который должен быть в описании конкурента
 }
 
 # Стратегии, когда подходящих конкурентов нет (по умолчанию — не менять цену).
@@ -198,6 +207,14 @@ def load_config() -> None:
                 merged["interval"] = float(merged.get("interval", MIN_SAFE_INTERVAL))
             except (TypeError, ValueError):
                 merged["interval"] = MIN_SAFE_INTERVAL
+            if merged.get("delivery") not in DELIVERY_MODES:
+                merged["delivery"] = "all"
+            merged["online_only"] = bool(merged.get("online_only", False))
+            try:
+                merged["min_reviews"] = max(0, int(merged.get("min_reviews", 0) or 0))
+            except (TypeError, ValueError):
+                merged["min_reviews"] = 0
+            merged["keyword"] = str(merged.get("keyword", "") or "")
             lots[str(lot_id)] = merged
         data["lots"] = lots
         try:
@@ -413,6 +430,10 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
     step = float(lot_cfg["step"])
     strategy = lot_cfg["no_competitor_strategy"]
     custom_price = float(lot_cfg.get("custom_price", 0.0))
+    f_delivery = lot_cfg.get("delivery", "all")
+    f_online = bool(lot_cfg.get("online_only", False))
+    f_min_reviews = int(lot_cfg.get("min_reviews", 0) or 0)
+    f_keyword = (lot_cfg.get("keyword", "") or "").strip().lower()
 
     # Блокировка исключает одновременное изменение одного и того же лота.
     lock = _lot_lock(lot_id)
@@ -468,6 +489,21 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
             amount = getattr(c, "amount", None)
             if amount is not None and amount == 0:
                 continue                      # лот недоступен (нет в наличии)
+
+            # --- пользовательские фильтры конкурентов ---
+            desc = (getattr(c, "description", None)
+                    or getattr(c, "title", None) or "").lower()
+            if f_delivery == "id" and "id" not in desc:
+                continue                      # не «пополнение по ID»
+            if f_delivery == "code" and "код" not in desc:
+                continue                      # не «пополнение кодом»
+            if f_keyword and f_keyword not in desc:
+                continue                      # не подходит по ключевому слову
+            if f_online and not getattr(seller, "online", False):
+                continue                      # только онлайн-продавцы
+            if f_min_reviews > 0 and int(getattr(seller, "reviews", 0) or 0) < f_min_reviews:
+                continue                      # мало отзывов у продавца
+
             filtered.append(c)
 
         # 4. Подходят по диапазону [min_price, max_price] (в единицах пользователя:
@@ -502,6 +538,8 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
             current_price=current_price, competitors=total_found,
             valid=valid_count, min_comp=min_comp, target=target,
             symbol=symbol, mode=mode, error=None, updated=time.time(),
+            subcat_id=getattr(subcat, "id", None),
+            subcat_name=getattr(subcat, "name", None),
         )
 
         mode_note = " (цены для покупателя)" if mode == "buyer" else ""
@@ -671,6 +709,8 @@ CB_IGN_ADD = "ADigadd"  # ADigadd
 CB_IGN_DEL = "ADigdel"  # ADigdel:<seller_id>
 CB_RATE = "ADrate"      # ADrate
 CB_MODE = "ADmode"      # ADmode — переключить режим цены (продавец/покупатель)
+CB_DELIV = "ADdlv"      # ADdlv:<lot_id> — цикл фильтра доставки
+CB_ONLINE = "ADonl"     # ADonl:<lot_id> — вкл/выкл «только онлайн»
 
 # Состояния ввода (msg_handler по префиксу "AD:").
 ST_ADD = "AD:add"
@@ -752,6 +792,19 @@ def _register_telegram(cardinal: "Cardinal") -> None:
         if lot["no_competitor_strategy"] == "custom":
             kb.add(B(f"Заданная цена: {_fmt(lot.get('custom_price', 0.0))}",
                      callback_data=f"{CB_SET}:cprice:{lot_id}"))
+        # Фильтры конкурентов.
+        kb.row(
+            B(f"Доставка: {DELIVERY_TITLES.get(lot.get('delivery', 'all'))}",
+              callback_data=f"{CB_DELIV}:{lot_id}"),
+            B(f"Онлайн: {'да' if lot.get('online_only') else 'нет'}",
+              callback_data=f"{CB_ONLINE}:{lot_id}"),
+        )
+        kb.row(
+            B(f"Мин. отзывов: {int(lot.get('min_reviews', 0))}",
+              callback_data=f"{CB_SET}:reviews:{lot_id}"),
+            B(f"Фильтр текста: {lot.get('keyword') or '—'}",
+              callback_data=f"{CB_SET}:kw:{lot_id}"),
+        )
         if lot.get("enabled"):
             kb.add(B("⏹ Остановить", callback_data=f"{CB_TOGGLE}:{lot_id}"))
         else:
@@ -793,6 +846,20 @@ def _register_telegram(cardinal: "Cardinal") -> None:
             f"│ Подходящих: {valid}",
             f"│ Минимум конкурентов: {mincomp}",
         ]
+        subcat_id = st.get("subcat_id")
+        if subcat_id:
+            sc_name = st.get("subcat_name") or ""
+            lines.append("│")
+            lines.append(f"│ Категория: <code>{subcat_id}</code> {sc_name}".rstrip())
+        # Сводка фильтров.
+        flt = [f"доставка «{DELIVERY_TITLES.get(lot.get('delivery', 'all'))}»"]
+        if lot.get("online_only"):
+            flt.append("только онлайн")
+        if int(lot.get("min_reviews", 0)) > 0:
+            flt.append(f"отзывов ≥ {int(lot['min_reviews'])}")
+        if lot.get("keyword"):
+            flt.append(f"текст «{lot['keyword']}»")
+        lines.append(f"│ Фильтры: {', '.join(flt)}")
         if err:
             lines.append(f"│ ⚠️ Ошибка: {err}")
         lines.append("└─")
@@ -853,6 +920,27 @@ def _register_telegram(cardinal: "Cardinal") -> None:
             if lot:
                 idx = NO_COMP_STRATEGIES.index(lot["no_competitor_strategy"])
                 lot["no_competitor_strategy"] = NO_COMP_STRATEGIES[(idx + 1) % len(NO_COMP_STRATEGIES)]
+        save_config()
+        _edit(call, text_lot(lot_id), kb_lot(lot_id))
+        bot.answer_callback_query(call.id)
+
+    def cycle_delivery(call: "CallbackQuery"):
+        lot_id = call.data.split(":", 1)[1]
+        with _CFG_LOCK:
+            lot = _CFG["lots"].get(lot_id)
+            if lot:
+                idx = DELIVERY_MODES.index(lot.get("delivery", "all"))
+                lot["delivery"] = DELIVERY_MODES[(idx + 1) % len(DELIVERY_MODES)]
+        save_config()
+        _edit(call, text_lot(lot_id), kb_lot(lot_id))
+        bot.answer_callback_query(call.id)
+
+    def toggle_online(call: "CallbackQuery"):
+        lot_id = call.data.split(":", 1)[1]
+        with _CFG_LOCK:
+            lot = _CFG["lots"].get(lot_id)
+            if lot:
+                lot["online_only"] = not lot.get("online_only", False)
         save_config()
         _edit(call, text_lot(lot_id), kb_lot(lot_id))
         bot.answer_callback_query(call.id)
@@ -925,7 +1013,10 @@ def _register_telegram(cardinal: "Cardinal") -> None:
         _, param, lot_id = call.data.split(":", 2)
         titles = {"min": "минимальную цену", "max": "максимальную цену",
                   "step": "шаг снижения", "int": "интервал проверки (сек, можно дробный)",
-                  "cprice": "заданную цену (стратегия «без конкурентов»)"}
+                  "cprice": "заданную цену (стратегия «без конкурентов»)",
+                  "reviews": "минимум отзывов у конкурента (0 — без ограничения)",
+                  "kw": "текст, который должен быть в описании конкурента "
+                        "(отправьте «-» чтобы очистить)"}
         m = bot.send_message(call.message.chat.id,
                              f"Отправьте новое значение — {titles.get(param, param)}:")
         tg.set_state(m.chat.id, m.id, call.from_user.id, f"{ST_SET}:{param}:{lot_id}",
@@ -988,6 +1079,17 @@ def _register_telegram(cardinal: "Cardinal") -> None:
 
         if state.startswith(ST_SET):
             _, _, param, lot_id = state.split(":", 3)
+            # Текстовый фильтр — принимаем строку, не число.
+            if param == "kw":
+                with _CFG_LOCK:
+                    lot = _CFG["lots"].get(lot_id)
+                    if not lot:
+                        reply("Лот не найден.")
+                        return
+                    lot["keyword"] = "" if text in ("-", "") else text
+                save_config()
+                _refresh_card(message.chat.id, card_mid, text_lot(lot_id), kb_lot(lot_id))
+                return
             value = text.replace(",", ".")
             try:
                 num = float(value)
@@ -999,7 +1101,9 @@ def _register_telegram(cardinal: "Cardinal") -> None:
                 if not lot:
                     reply("Лот не найден.")
                     return
-                if param == "min":
+                if param == "reviews":
+                    lot["min_reviews"] = max(0, int(num))
+                elif param == "min":
                     lot["min_price"] = max(0.0, round(num, 2))
                 elif param == "max":
                     lot["max_price"] = max(0.0, round(num, 2))
@@ -1043,6 +1147,8 @@ def _register_telegram(cardinal: "Cardinal") -> None:
     tg.cbq_handler(ask_add, lambda c: c.data == CB_ADD)
     tg.cbq_handler(ask_set, lambda c: c.data.startswith(f"{CB_SET}:"))
     tg.cbq_handler(cycle_strategy, lambda c: c.data.startswith(f"{CB_STRAT}:"))
+    tg.cbq_handler(cycle_delivery, lambda c: c.data.startswith(f"{CB_DELIV}:"))
+    tg.cbq_handler(toggle_online, lambda c: c.data.startswith(f"{CB_ONLINE}:"))
     tg.cbq_handler(toggle_lot, lambda c: c.data.startswith(f"{CB_TOGGLE}:"))
     tg.cbq_handler(confirm_delete, lambda c: c.data.startswith(f"{CB_DEL}:"))
     tg.cbq_handler(do_delete, lambda c: c.data.startswith(f"{CB_DEL_OK}:"))
