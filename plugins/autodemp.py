@@ -107,6 +107,9 @@ DEFAULT_CONFIG = {
     "max_changes_per_min": 10,   # защита от ценовой войны
     "ignored_sellers": [],       # id продавцов, чьи лоты игнорируются
     "price_mode": "seller",      # seller | buyer
+    # Экспериментально: обход серверного кэша FunPay (cache-buster) для более
+    # свежих цен конкурентов. Помогает НЕ во всех разделах и повышает нагрузку.
+    "fast_check": False,
     "lots": {},                  # {lot_id(str): {...}}
 }
 
@@ -136,6 +139,10 @@ _RATE_LOCK = threading.Lock()
 _COMP_CACHE: dict[tuple, tuple[float, list]] = {}
 _COMP_CACHE_LOCK = threading.Lock()
 _COMP_FETCH_LOCKS: dict[tuple, threading.Lock] = {}
+# Сериализует временный monkey-patch account.method при cache-buster запросе.
+_METHOD_PATCH_LOCK = threading.Lock()
+# Пути публичного списка лотов, к которым добавляем cache-buster.
+_PUBLIC_LOTS_RE = re.compile(r"^(lots|chips)/\d+/$")
 
 _CARDINAL: "Cardinal | None" = None
 
@@ -231,6 +238,7 @@ def load_config() -> None:
             data["max_changes_per_min"] = 10
         if data.get("price_mode") not in PRICE_MODES:
             data["price_mode"] = "seller"
+        data["fast_check"] = bool(data.get("fast_check", False))
         _CFG = data
 
 
@@ -378,12 +386,44 @@ def _get_competitors(account, subcat, stop: "threading.Event"):
             entry = _COMP_CACHE.get(key)
             if entry and now - entry[0] <= COMP_CACHE_TTL:
                 return entry[1]
-        lots = _call_with_retry(
-            account.get_subcategory_public_lots, subcat.type, subcat.id, stop=stop
-        )
+        lots = _fetch_public_lots(account, subcat, stop)
         with _COMP_CACHE_LOCK:
             _COMP_CACHE[key] = (time.time(), lots)
         return lots
+
+
+def _fetch_public_lots(account, subcat, stop: "threading.Event"):
+    """
+    Запрашивает публичные лоты подкатегории. В режиме fast_check добавляет к
+    URL cache-buster, чтобы обойти серверный кэш FunPay и получить более свежие
+    цены (экспериментально). Разбор HTML — «родным» парсером FunPayAPI.
+    """
+    with _CFG_LOCK:
+        fast = bool(_CFG.get("fast_check", False))
+    if not fast:
+        return _call_with_retry(
+            account.get_subcategory_public_lots, subcat.type, subcat.id, stop=stop
+        )
+
+    # Временный monkey-patch account.method: добавляем cache-buster только к
+    # пути публичного списка лотов (lots/{id}/ или chips/{id}/), не трогая
+    # остальные запросы (save_lot и пр.). Сериализовано глобальным локом.
+    with _METHOD_PATCH_LOCK:
+        orig_method = account.method
+
+        def _patched(request_method, api_method, *args, **kwargs):
+            if isinstance(api_method, str) and _PUBLIC_LOTS_RE.match(api_method):
+                sep = "&" if "?" in api_method else "?"
+                api_method = f"{api_method}{sep}_cb={int(time.time() * 1000)}"
+            return orig_method(request_method, api_method, *args, **kwargs)
+
+        account.method = _patched
+        try:
+            return _call_with_retry(
+                account.get_subcategory_public_lots, subcat.type, subcat.id, stop=stop
+            )
+        finally:
+            account.method = orig_method
 
 
 # --------------------------------------------------------------------------- #
@@ -730,6 +770,7 @@ CB_IGN_ADD = "ADigadd"  # ADigadd
 CB_IGN_DEL = "ADigdel"  # ADigdel:<seller_id>
 CB_RATE = "ADrate"      # ADrate
 CB_MODE = "ADmode"      # ADmode — переключить режим цены (продавец/покупатель)
+CB_FAST = "ADfast"      # ADfast — вкл/выкл экспериментальную «быструю проверку»
 CB_DELIV = "ADdlv"      # ADdlv:<lot_id> — цикл фильтра доставки
 CB_ONLINE = "ADonl"     # ADonl:<lot_id> — вкл/выкл «только онлайн»
 CB_AGGR = "ADaggr"      # ADaggr:<lot_id> — вкл/выкл агрессивный режим
@@ -774,8 +815,11 @@ def _register_telegram(cardinal: "Cardinal") -> None:
             kb.add(B(label, callback_data=f"{CB_LOT}:{lot_id}"))
         with _CFG_LOCK:
             mode = _CFG.get("price_mode", "seller")
+            fast = _CFG.get("fast_check", False)
         kb.add(B("➕ Добавить лот", callback_data=CB_ADD))
         kb.add(B(f"💱 Цены: {PRICE_MODE_TITLES.get(mode)}", callback_data=CB_MODE))
+        kb.add(B(f"⚡ Быстрая проверка (эксп.): {'ВКЛ' if fast else 'выкл'}",
+                 callback_data=CB_FAST))
         kb.add(B(f"🛡 Лимит изм./мин: {rate}", callback_data=CB_RATE))
         kb.add(B("🚫 Игнор-список продавцов", callback_data=CB_IGN))
         kb.add(B("◀️ Назад", callback_data=f"{CBT.EDIT_PLUGIN}:{UUID}:0"
@@ -788,10 +832,12 @@ def _register_telegram(cardinal: "Cardinal") -> None:
             rate = _CFG.get("max_changes_per_min", 10)
             ign = _CFG.get("ignored_sellers", [])
             mode = _CFG.get("price_mode", "seller")
+            fast = _CFG.get("fast_check", False)
         return (
             "🤖 <b>AutoDemp — автодемпинг</b>\n\n"
             f"Лотов настроено: <b>{len(lots)}</b>\n"
             f"Режим цены: <b>{PRICE_MODE_TITLES.get(mode)}</b>\n"
+            f"Быстрая проверка: <b>{'ВКЛ' if fast else 'выкл'}</b>\n"
             f"Лимит изменений цены: <b>{rate}/мин</b>\n"
             f"Игнорируется продавцов: <b>{len(ign)}</b>\n\n"
             "Выберите лот для настройки или добавьте новый."
@@ -939,6 +985,19 @@ def _register_telegram(cardinal: "Cardinal") -> None:
         _edit(call, text_main(), kb_main())
         bot.answer_callback_query(
             call.id, f"Режим цены: {PRICE_MODE_TITLES.get(new)}", show_alert=True)
+
+    def toggle_fast(call: "CallbackQuery"):
+        with _CFG_LOCK:
+            _CFG["fast_check"] = not _CFG.get("fast_check", False)
+            new = _CFG["fast_check"]
+        save_config()
+        _edit(call, text_main(), kb_main())
+        bot.answer_callback_query(
+            call.id,
+            "Быстрая проверка ВКЛ: обход кэша FunPay (свежее цены, но выше "
+            "нагрузка). Проверьте, стало ли быстрее." if new
+            else "Быстрая проверка выключена",
+            show_alert=True)
 
     def cycle_strategy(call: "CallbackQuery"):
         lot_id = call.data.split(":", 1)[1]
@@ -1200,6 +1259,7 @@ def _register_telegram(cardinal: "Cardinal") -> None:
     tg.cbq_handler(del_ignore, lambda c: c.data.startswith(f"{CB_IGN_DEL}:"))
     tg.cbq_handler(ask_rate, lambda c: c.data == CB_RATE)
     tg.cbq_handler(toggle_mode, lambda c: c.data == CB_MODE)
+    tg.cbq_handler(toggle_fast, lambda c: c.data == CB_FAST)
 
     tg.msg_handler(
         handle_input,
