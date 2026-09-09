@@ -134,6 +134,13 @@ COMM_CACHE_TTL = 600.0        # сек — как часто перепрове�
 _REFRESH: dict[Any, dict] = {}
 _REFRESH_LOCK = threading.Lock()
 
+# Кэш полей лота (своя цена/подкатегория/валюта), чтобы не запрашивать поля лота
+# каждый цикл. Поля перечитываются при реальном изменении цены и раз в LOT_META_TTL
+# секунд (сверка на случай ручного изменения). Экономит ~половину запросов.
+_LOT_META: dict[str, dict] = {}
+_META_LOCK = threading.Lock()
+LOT_META_TTL = 60.0            # сек — как часто сверять поля лота без изменения цены
+
 # --------------------------------------------------------------------------- #
 #                       Глобальное состояние времени выполнения               #
 # --------------------------------------------------------------------------- #
@@ -372,10 +379,12 @@ def _coeff_from_calc(calc_result) -> float | None:
     return k if k > 0 else None
 
 
-def _commission_coefficient(account, lf, subcat, stop: "threading.Event") -> float | None:
+def _commission_coefficient(account, lf, subcat, stop: "threading.Event",
+                            price_hint: float | None = None) -> float | None:
     """
     Коэффициент комиссии FunPay для подкатегории (buyer = seller * k).
     Источники по приоритету: поля лота -> account.calc() -> кэш.
+    `lf` может быть None (тогда используется account.calc с price_hint).
     Возвращает None, если получить не удалось (тогда buyer-режим пропускает цикл,
     чтобы не выставить неверную цену).
     """
@@ -390,7 +399,7 @@ def _commission_coefficient(account, lf, subcat, stop: "threading.Event") -> flo
         if cached and now - cached[0] <= COMM_CACHE_TTL:
             return cached[1]
         try:
-            base = lf.price if getattr(lf, "price", None) else 1000
+            base = (getattr(lf, "price", None) or price_hint or 1000)
             calc = _call_with_retry(account.calc, subcat.type, subcat.id,
                                     stop=stop, price=base)
             k = _coeff_from_calc(calc)
@@ -528,23 +537,35 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
         # Другой цикл уже работает с этим лотом — пропускаем.
         return
     try:
-        # 1. Текущая цена и поля лота (одним запросом, переиспользуем для save).
-        lf = _call_with_retry(account.get_lot_fields, int(lot_id), stop=stop)
-        current_seller = lf.price
-        symbol = _currency_symbol(getattr(lf, "currency", None))
+        # 1. Поля лота (своя цена/подкатегория/валюта) — берём из кэша, чтобы не
+        #    запрашивать каждый цикл. Полный запрос: если кэша нет/устарел.
+        now0 = time.time()
+        with _META_LOCK:
+            meta = _LOT_META.get(lot_id)
+        need_full = (meta is None) or (now0 - meta.get("ts", 0) > LOT_META_TTL)
+        lf = None
+        if need_full:
+            lf = _call_with_retry(account.get_lot_fields, int(lot_id), stop=stop)
+            subcat = getattr(lf, "subcategory", None)
+            if subcat is None:
+                logger.error(f"{LOGGER_PREFIX} Лот {lot_id}: не удалось определить подкатегорию.")
+                _set_stat(lot_id, error="нет подкатегории", updated=time.time())
+                return
+            symbol = _currency_symbol(getattr(lf, "currency", None))
+            current_seller = lf.price
+            with _META_LOCK:
+                _LOT_META[lot_id] = {"subcat": subcat, "symbol": symbol,
+                                     "price": current_seller, "ts": now0}
+        else:
+            subcat = meta["subcat"]
+            symbol = meta["symbol"]
+            current_seller = meta["price"]
 
-        subcat = getattr(lf, "subcategory", None)
-        if subcat is None:
-            logger.error(f"{LOGGER_PREFIX} Лот {lot_id}: не удалось определить подкатегорию.")
-            _set_stat(lot_id, error="нет подкатегории", updated=time.time())
-            return
-
-        # Комиссия FunPay нужна ВСЕГДА: цена лота (get_lot_fields) — для продавца,
-        # а цены конкурентов (get_subcategory_public_lots) — уже для покупателя
-        # (с комиссией). Поэтому сравниваем всё в цене покупателя.
+        # Комиссия FunPay нужна ВСЕГДА: цена лота — для продавца, а цены
+        # конкурентов из списка — уже для покупателя (с комиссией).
         with _CFG_LOCK:
             mode = _CFG.get("price_mode", "seller")
-        k = _commission_coefficient(account, lf, subcat, stop)
+        k = _commission_coefficient(account, lf, subcat, stop, price_hint=current_seller)
         if not k:
             logger.error(
                 f"{LOGGER_PREFIX} Лот {lot_id}: не удалось получить комиссию FunPay "
@@ -690,6 +711,23 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
                         f"обновления таблицы (синхронизация).")
             return
 
+        # Нужно менять цену. Если поля лота ещё не загружены (работали по кэшу) —
+        # грузим сейчас (нужны для сохранения) и сверяем реальную текущую цену.
+        if lf is None:
+            lf = _call_with_retry(account.get_lot_fields, int(lot_id), stop=stop)
+            real_seller = lf.price
+            with _META_LOCK:
+                m = _LOT_META.get(lot_id)
+                if m:
+                    m["price"] = real_seller
+                    m["ts"] = time.time()
+            if _prices_equal(round(real_seller, 2), target_seller):
+                # Кэш был устаревшим — реальная цена уже оптимальна.
+                _set_stat(lot_id, current_price=_disp(real_seller * k), updated=time.time())
+                logger.info(f"{LOGGER_PREFIX} {header}\nЦена уже оптимальна (сверено).")
+                return
+            current_seller = real_seller
+
         new_note = _fmt(target, symbol)
         if mode == "buyer":
             new_note += f" (покупатель) → {_fmt(target_seller, symbol)} продавцу"
@@ -712,6 +750,11 @@ def _process_lot_once(cardinal: "Cardinal", lot_id: str,
                 pass
             _call_with_retry(account.save_lot, lf, stop=stop)
             _rate_register()
+            with _META_LOCK:                     # запоминаем новую свою цену
+                m = _LOT_META.get(lot_id)
+                if m:
+                    m["price"] = float(target_seller)
+                    m["ts"] = time.time()
             _set_stat(lot_id, current_price=_disp(target_seller * k), updated=time.time())
             logger.info(
                 f"{LOGGER_PREFIX} {header}\nНовая цена: {new_note}\n"
@@ -1172,6 +1215,8 @@ def _register_telegram(cardinal: "Cardinal") -> None:
         with _CFG_LOCK:
             _CFG["lots"].pop(lot_id, None)
             _STATS.pop(lot_id, None)
+        with _META_LOCK:
+            _LOT_META.pop(lot_id, None)
         save_config()
         _edit(call, text_main(), kb_main())
         bot.answer_callback_query(call.id, "Лот удалён")
